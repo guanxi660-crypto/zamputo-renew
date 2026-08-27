@@ -1,385 +1,208 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Zampto 自动续期 - GitHub Actions 版
+逻辑: 注入 cookies -> 打开服务器页 -> 解析到期时间 -> 剩余<threshold 则点击续期
+      -> 等待 Turnstile 自动通过 -> 验证结果 -> Telegram 通知
+代理: 直接使用 NODE_LINK (socks5://user:pass@host:port), Chromium 直连
+凭证: 全部从环境变量/Secrets 读取, 不进仓库
+"""
+import json, os, re, sys
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
-import os,re,sys,time,random,requests
-from playwright.sync_api import sync_playwright
+# ---- 环境变量 (GitHub Secrets) ----
+COOKIE_JSON  = os.environ.get('COOKIE_JSON', '')     # 完整 cookies JSON (session.json 内容)
+EMAIL        = os.environ.get('EMAIL', '')
+PASSWORD     = os.environ.get('PASSWORD', '')
+NODE_LINK    = os.environ.get('NODE_LINK', '')       # socks5://user:pass@host:port
+TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '')
+TG_CHAT_ID   = os.environ.get('TG_CHAT_ID', '')
+SERVER_ID    = os.environ.get('SERVER_ID', '9810')
+THRESHOLD_H  = float(os.environ.get('RENEW_THRESHOLD_HOURS', '24'))
+FORCE        = os.environ.get('FORCE_RENEW', 'false').lower() == 'true'
 
-# --- 环境变量 ---
-COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""    # remember_web cookie 值，必填
-EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，作为备用,TG通知需要填写
-PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用
-TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选
-TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选
+BASE = "https://dash.zampto.net"
 
-BASE_URL = "https://dash.hidencloud.com"
-LOGIN_URL = f"{BASE_URL}/auth/login"
+def log(msg):
+    line = f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
 
-# --- 代理配置（由工作流 shell 脚本写入 $GITHUB_ENV）---
-IS_PROXY      = os.environ.get('IS_PROXY', 'false').lower() == 'true'
-PROXY_SERVER  = os.environ.get('PROXY_SERVER') or "socks5://127.0.0.1:1080"
-REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
+def send_tg(text):
+    if not (TG_BOT_TOKEN and TG_CHAT_ID):
+        log("ℹ️ 未配置 TG, 跳过通知")
+        return
+    try:
+        import requests
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
+        if r.status_code == 200:
+            log("✅ TG 通知已发送")
+        else:
+            log(f"⚠️ TG 发送失败: HTTP {r.status_code}")
+    except Exception as e:
+        log(f"⚠️ TG 异常: {e}")
 
-# 日志
-def log(message):
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+def parse_hours(text):
+    """从页面文本解析剩余时间 -> 小时数"""
+    m = re.search(r'Expiry \(Next Renewal\):\s*([\d.]+)\s*d(?:\s+(\d+)\s*h)?(?:\s+(\d+)\s*m)?', text)
+    if m:
+        days = float(m.group(1)); hours = int(m.group(2) or 0); mins = int(m.group(3) or 0)
+        return days * 24 + hours + mins / 60.0
+    return None
+
+def get_last_renewed(text):
+    m = re.search(r'Server last renewed:\s*([A-Za-z]{3}\s*\d{1,2},\s*\d{4},\s*\d{1,2}:\d{2}\s*[AP]M\s*UTC)', text)
+    return m.group(1) if m else None
 
 STEALTH_JS = """
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-window.chrome = { runtime: {} };
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+window.chrome = {runtime: {}};
+const origQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+  parameters.name === 'notifications'
+    ? Promise.resolve({state: Notification.permission})
+    : origQuery(parameters)
+);
 """
 
-def get_current_ip(proxy_server=None):
-    """获取当前出口IP"""
-    proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
-    try:
-        resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
-        # log(f"请求出口IP完成, status={resp.status_code}")
-        if resp.status_code == 200:
-            return resp.text.strip()
-        return "获取失败"
-    except Exception as e:
-        log(f"❌ 获取出口IP失败: {e}")
-        return "获取失败"
-
-def send_telegram_notification(status, old_due, new_due):
-    """发送 Telegram 通知"""
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log("⚠️ Telegram 未配置，跳过通知")
-        return False
-    
-    # 获取运行时间
-    local_time = time.gmtime(time.time() + 8 * 3600)
-    now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
-    if '@' in EMAIL:
-        name, domain = EMAIL.split('@', 1)
-        if len(name) > 4:
-            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
-        else:
-            masked_email = f"{name}@{domain}"
-    else:
-        masked_email = EMAIL[:2] + '****' 
-
-    text = (
-        f"🎉 HidenCloud 续期通知\n\n"
-        f"{status}\n"
-        f"👤 账号: {masked_email}\n"
-        f"📅 续期前到期：{old_due}\n"
-        f"📅 续期后到期：{new_due}\n"
-        f"🕒 续期时间：{now}"
-    )
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=10, proxies=REQUESTS_PROXIES)
-        if resp.status_code == 200:
-            log("✅ Telegram 通知发送成功")
-            return True
-        else:
-            log(f"❌ Telegram 通知失败: {resp.text}")
-            return False
-    except Exception as e:
-        log(f"❌ Telegram 通知异常: {e}")
-        return False
-
-def handle_cloudflare(page):
-    iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
-    if page.locator(iframe_selector).count() == 0:
-        return True
-    log("⚠️ 检测到 Cloudflare 验证...")
-    start_time = time.time()
-    while time.time() - start_time < 60:
-        if page.locator(iframe_selector).count() == 0:
-            log("✅ Cloudflare 验证通过！")
-            return True
-        try:
-            frame = page.frame_locator(iframe_selector)
-            checkbox = frame.locator('input[type="checkbox"]')
-            if checkbox.is_visible():
-                log("🖱️ 点击验证复选框...")
-                time.sleep(random.uniform(0.5, 1.5))
-                checkbox.click()
-                log("⏳ 已点击，等待验证结果...")
-                time.sleep(5)
-            else:
-                time.sleep(1)
-        except Exception:
-            pass
-    log("❌ 验证超时。")
-    return False
-
-def login(page):
-    # 1. Cookie 登录尝试
-    if COOKIE_VALUE:
-        log("📇 尝试 Cookie 登录...")
-        try:
-            page.context.add_cookies([{
-                'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
-                'value': COOKIE_VALUE,
-                'domain': 'dash.hidencloud.com',
-                'path': '/',
-                'expires': int(time.time()) + 3600 * 24 * 365,
-                'httpOnly': True,
-                'secure': True,
-                'sameSite': 'Lax'
-            }])
-            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-            handle_cloudflare(page)
-            page_title = page.title()
-            log(f"📝 当前Title: {page_title}")
-            if "auth/login" not in page.url:
-                log(f"✅ Cookie 登录成功！当前已到达dashboard页面")
-                return True
-            log("❌ Cookie 失效，请更换")
-        except:
-            pass
-
-    # 2. 账号密码登录
-    if not EMAIL or not PASSWORD:
-        return False
-    log("💣 尝试账号密码登录...")
-    try:
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        page.fill('input[name="email"]', EMAIL)
-        page.fill('input[name="password"]', PASSWORD)
-        time.sleep(0.5)
-        handle_cloudflare(page)
-        page.click('button[type="submit"]')
-        time.sleep(3)
-        handle_cloudflare(page)
-        page.wait_for_url(f"{BASE_URL}/*", timeout=30000)
-        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        page_title = page.title()
-        log(f"📝 当前Title: {page_title}")
-        if "auth/login" in page.url:
-            log("❌ 登录失败。")
-            return False
-        log(f"✅ 账号密码登录成功！当前已到达dashboard页面")
-        return True
-    except Exception as e:
-        log(f"❌ 登录异常: {e}")
-        page.screenshot(path="login_fail.png")
-        return False
-
-def get_server_id(page):
-    try:
-        handle_cloudflare(page)
-        time.sleep(3)
-        html = page.content()
-        log(f"📝 页面长度: {len(html)}, URL: {page.url}")
-
-        # 方案1: 从 href 链接中提取 /service/数字/manage
-        matches = re.findall(r'/service/(\d+)/manage', html)
-        if matches:
-            server_id = matches[0]
-            log(f"✅ 从链接中获取到 Server ID: {server_id}")
-            return server_id
-
-        # 方案2: 从 span 标签中提取 #数字 (如 "Free Server #218079")
-        matches = re.findall(r'#(\d{4,})', html)
-        if matches:
-            server_id = matches[0]
-            log(f"✅ 从文本 #号中获取到 Server ID: {server_id}")
-            return server_id
-
-        log("❌ 所有 URL 均未找到 Server ID")
-        return None
-    except Exception as e:
-        log(f"❌ 获取 Server ID 失败: {e}")
-        page.screenshot(path="server_id_error.png")
-        return None
-
-def get_due_date(page):
-    try:
-        if SERVICE_URL not in page.url:
-            page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        body_text = page.locator("body").inner_text()
-        patterns = [
-            r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-            r"Due date\s*\n\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-            r"Due date.*?(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, body_text, re.IGNORECASE | re.DOTALL)
-            if match:
-                due_date = match.group(1).strip()
-                log(f"📅 获取到Due Date: {due_date}")
-                return due_date
-    except Exception as e:
-        log(f"❌ 获取Due Date失败: {e}")
-    return "未知"
-
-def renew_service(page):
-
-    try:
-        log("➡ 进入续期流程...")
-        if page.url != SERVICE_URL:
-            page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-
-        log("🖱️ 准备点击 'Renew' 按钮...")
-        renew_btn = page.locator('button:has-text("Renew")')
-        create_btn = page.locator('button:has-text("Create Invoice")')
-
-        modal_opened = False
-        for i in range(3):
-            try:
-                renew_btn.wait_for(state="visible", timeout=10000)
-                renew_btn.scroll_into_view_if_needed()
-                log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
-                renew_btn.click()
-
-                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
-                time.sleep(2)
-                page_text = page.locator("body").inner_text()
-                if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
-                    log("⚠️ 未到续期时间，无法续期。")
-                    page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"   # 特殊状态
-
-                log("🖲️ 等待弹窗出现...")
-                try:
-                    create_btn.wait_for(state="visible", timeout=5000)
-                    modal_opened = True
-                    log("✅ 弹窗已成功弹出！")
-                    break
-                except:
-                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
-                    time.sleep(2)
-            except Exception as e:
-                log(f"❌ 点击尝试出错: {e}")
-
-        if not modal_opened:
-            log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
-            page.screenshot(path="renew_modal_failed.png")
-            return False
-
-        handle_cloudflare(page)
-        log("🖱️ 点击 'Create Invoice'...")
-        create_btn.click()
-
-        new_invoice_url = None
-        start_wait = time.time()
-        while time.time() - start_wait < 90:
-            if "/payment/invoice/" in page.url:
-                new_invoice_url = page.url
-                log(f"🎉 页面已跳转: {new_invoice_url}")
-                break
-            if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
-                log("⚠️ 遇到拦截，尝试处理...")
-                handle_cloudflare(page)
-            time.sleep(1)
-
-        if not new_invoice_url:
-            log("❌ 未能进入发票页面，超时。")
-            page.screenshot(path="renew_stuck_invoice.png")
-            return False
-
-        if page.url != new_invoice_url:
-            page.goto(new_invoice_url)
-        handle_cloudflare(page)
-
-        log("🔎 查找 'Pay' 按钮...")
-        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
-        pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.click()
-        log("✅ 'Pay' 按钮已点击。")
-
-        # 等待支付确认页面或跳转回服务页
-        time.sleep(5)
-        # 返回服务管理页面以获取新的到期时间
-        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        return True
-
-    except Exception as e:
-        log(f"❌ 续费异常: {e}")
-        page.screenshot(path="renew_error.png")
-        return False
-
 def main():
-    # 检查必要环境变量
-    if not COOKIE_VALUE and not (EMAIL and PASSWORD):
-        log("❌ 缺少登录凭证")
+    log("🚀 Zampto 自动续期 (GitHub Actions) | Server=%s | 阈值=%.1fh" % (SERVER_ID, THRESHOLD_H))
+
+    # 解析代理
+    proxy_server = None
+    if NODE_LINK:
+        p = urlparse(NODE_LINK)
+        if p.scheme.startswith('socks'):
+            userinfo = f"{p.username}:{p.password}@" if p.username else ""
+            proxy_server = f"socks5://{userinfo}{p.hostname}:{p.port}"
+        else:
+            log(f"❌ 不支持的 NODE_LINK 协议: {p.scheme}")
+            sys.exit(1)
+    else:
+        log("❌ 未配置 NODE_LINK (socks5 代理)")
+        sys.exit(1)
+    log(f"🌐 代理: {proxy_server.split('@')[-1] if '@' in proxy_server else proxy_server}")
+
+    # 解析 cookies
+    try:
+        data = json.loads(COOKIE_JSON)
+        cookies = data.get('cookies', data) if isinstance(data, dict) else data
+        if not isinstance(cookies, list):
+            raise ValueError("cookies 不是列表")
+        log(f"🍪 cookies: {len(cookies)} 个")
+    except Exception as e:
+        log(f"❌ COOKIE_JSON 解析失败: {e}")
         sys.exit(1)
 
-    global SERVICE_URL
+    from playwright.sync_api import sync_playwright
 
-    with sync_playwright() as p:
-        try:
-            if IS_PROXY:
-                log(f"⚙️ 代理已启用: {PROXY_SERVER}")
-            else:
-                log("🌐 直连模式（未使用代理）")
-            
-            # 获取当前出口ip
-            current_ip = get_current_ip(PROXY_SERVER)
-            log(f"🎯 当前出口IP: {current_ip}")
-
-            log("🚀 启动浏览器...")
+    success = False
+    result_msg = ""
+    try:
+        with sync_playwright() as p:
             browser = p.chromium.launch(
-                channel="chrome",
-                headless=False,
-                args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars']
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                ],
+                proxy={"server": proxy_server} if proxy_server else None,
             )
             context = browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                proxy={"server": PROXY_SERVER} if IS_PROXY else None
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                timezone_id="America/Los_Angeles",
             )
+            context.add_init_script(STEALTH_JS)
+            for c in cookies:
+                try:
+                    context.add_cookies([{
+                        "name": c.get("name"), "value": c.get("value"),
+                        "domain": c.get("domain", "dash.zampto.net"),
+                        "path": c.get("path", "/"),
+                    }])
+                except Exception:
+                    pass
             page = context.new_page()
-            page.add_init_script(STEALTH_JS)
 
-            if not login(page):
-                sys.exit(1)
+            # 打开服务器页
+            server_url = f"{BASE}/server?id={SERVER_ID}"
+            log(f"📂 打开: {server_url}")
+            page.goto(server_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(6000)
 
-            # 登录成功后，自动获取 Server ID
-            server_id = get_server_id(page)
-            if not server_id:
-                log("❌ 无法获取 Server ID，退出。")
-                sys.exit(1)
-            SERVICE_URL = f"{BASE_URL}/service/{server_id}/manage"
+            text = page.inner_text("body")
+            hours_left = parse_hours(text)
+            last_renewed = get_last_renewed(text)
+            log(f"📊 页面状态: last renewed={last_renewed or '?'}, 剩余={hours_left if hours_left is not None else '?'}h")
 
-            # 获取旧到期时间
-            old_due = get_due_date(page)
-            log(f"📆 续费前到期时间：{old_due}")
-
-            # 执行续费
-            renew_result = renew_service(page)
-
-            new_due = old_due
-            if renew_result == "NOT_TIME":
-                log("⏳ 未到续期时间，目前无法续期")
-                status = "⏳ 未到续期时间"
-            elif renew_result is False:
-                log("❌ 续费失败，脚本退出。")
-                status = "❌ 续期失败"
-            else:  # renew_result is True
-                new_due = get_due_date(page)
-                log(f"📆 续费后到期时间：{new_due}")
-                status = "✅ 续期成功"
-
-            # 发送 Telegram 通知
-            send_telegram_notification(status, old_due, new_due)
-
-            if renew_result == "NOT_TIME":
-                sys.exit(0)
-            elif renew_result is False:
-                sys.exit(1)
+            if hours_left is not None and hours_left > THRESHOLD_H and not FORCE:
+                result_msg = f"⏭️ 剩余 {hours_left:.1f}h (>阈值 {THRESHOLD_H}h)，无需续期"
+                log(result_msg)
             else:
-                sys.exit(0)
-        except Exception as e:
-            log(f"❌ 浏览器启动出错: {e}")
-            sys.exit(1)
-        finally:
-            if 'browser' in locals() and browser:
-                browser.close()
-                
+                # 点击续期
+                log("🖱️ 查找并点击续期按钮...")
+                clicked = False
+                for btn_text in ["Renew Server", "Renew", "Extend"]:
+                    try:
+                        btn = page.get_by_role("button", name=btn_text).first
+                        btn.click(timeout=8000)
+                        clicked = True
+                        break
+                    except Exception:
+                        pass
+                if not clicked:
+                    try:
+                        page.locator("text=Renew Server").first.click(timeout=8000)
+                        clicked = True
+                    except Exception:
+                        pass
+                if clicked:
+                    log("✅ 已点击续期按钮, 等待 Turnstile 自动通过...")
+                    # 等待 Turnstile iframe 出现
+                    for i in range(6):
+                        has_ts = any('challenges.cloudflare.com' in (f.url or '') for f in page.frames)
+                        if has_ts:
+                            log(f"  ✅ [{i*5}s] Turnstile iframe 出现")
+                            break
+                        page.wait_for_timeout(5000)
+                    # 等待续期生效 (最多 120s)
+                    for i in range(12):
+                        page.wait_for_timeout(10000)
+                        text = page.inner_text("body")
+                        renewed = get_last_renewed(text)
+                        if renewed and renewed != last_renewed:
+                            log(f"  ✅ [{(i+1)*10}s] 检测到续期成功: {renewed}")
+                            break
+                    # 最终验证
+                    text = page.inner_text("body")
+                    hours_after = parse_hours(text)
+                    renewed_after = get_last_renewed(text)
+                    if renewed_after and renewed_after != last_renewed:
+                        success = True
+                        result_msg = f"✅ 续期成功！Server last renewed: {renewed_after} | 剩余 {hours_after:.1f}h"
+                    else:
+                        result_msg = f"⚠️ 未确认续期成功 (续期前 {hours_left if hours_left is not None else '?'}h -> 续期后 {hours_after if hours_after is not None else '?'}h)"
+                else:
+                    result_msg = "❌ 未找到续期按钮"
+            try:
+                page.screenshot(path="result.png")
+            except Exception:
+                pass
+            browser.close()
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        result_msg = f"❌ 异常: {e}"
+
+    log("")
+    log("📨 发送 Telegram 通知...")
+    send_tg(f"<b>⚡ Zampto 自动续期 (Server {SERVER_ID})</b>\n{result_msg}")
+    log(f"📌 结果: {result_msg}")
+    sys.exit(0 if success else 1)
+
 if __name__ == "__main__":
     main()
