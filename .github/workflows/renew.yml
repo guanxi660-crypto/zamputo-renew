@@ -12,7 +12,7 @@ permissions:
 jobs:
   Renew-Zampto:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -23,35 +23,30 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install system deps (xvfb virtual display)
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
       - name: Install dependencies
         run: |
-          pip install playwright requests 'requests[socks]'
-          python -m playwright install --with-deps chromium
+          pip install camoufox requests
+          python -m camoufox fetch
 
-      - name: Run Zampto renewal
+      - name: Run Zampto renewal (Camoufox)
         env:
           COOKIE_JSON: ${{ secrets.COOKIE_JSON }}
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWORD: ${{ secrets.PASSWORD }}
           NODE_LINK: ${{ secrets.NODE_LINK }}
+          SERVER_ID: ${{ secrets.SERVER_ID }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          SERVER_ID: ${{ secrets.SERVER_ID }}
           RENEW_THRESHOLD_HOURS: ${{ secrets.RENEW_THRESHOLD_HOURS }}
           FORCE_RENEW: ${{ secrets.FORCE_RENEW }}
-        run: python3 app.py
-
-      - name: Cleanup old workflow runs
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
-          count=0
-          for run_id in $runs; do
-            count=$((count + 1))
-            if [ $count -gt 1 ]; then
-              echo "Deleting run: $run_id"
-              gh run delete $run_id || true
-            fi
-          done
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python3 -u app.py
+
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zampto-screenshots
+          path: '*.png'
+          if-no-files-found: ignore
