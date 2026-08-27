@@ -28,7 +28,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install camoufox requests
+          pip install 'camoufox[geoip]' requests
           python -m camoufox fetch
 
       - name: Run Zampto renewal (Camoufox)
