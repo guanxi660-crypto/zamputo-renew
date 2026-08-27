@@ -1,4 +1,4 @@
-# Zampto 自动续期 (GitHub Actions)
+# Zampto 自动续期 (未完成！！ 勿用)
 
 使用 GitHub Actions 自动为 [Zampto](https://dash.zampto.net) 免费服务器续期。
 引擎使用 **Camoufox**（隐身 Firefox，humanize / disable_coop / geoip 抗风控），
