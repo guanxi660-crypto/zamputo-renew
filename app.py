@@ -240,7 +240,6 @@ with Camoufox(headless=False, humanize=True, os="windows", disable_coop=True,
             # 6. 等待 Turnstile (真实鼠标点击后 api.js 已加载)
             turnstile_ok = False
             if not clicked_ok:
-                send_tg(f"<b>⚡ Zampto 自动续期 (Server {SERVER_ID})</b>\n{result_msg}")
                 context.close()
                 sys.exit(1)
             # 6.1 等待 Turnstile iframe 出现
